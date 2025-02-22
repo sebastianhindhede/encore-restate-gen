@@ -1,0 +1,8 @@
+{
+    "name": "extract-handlers",
+    "version": "1.0.0",
+    "main": "extractHandlers.js",
+    "dependencies": {
+      "ts-morph": "^15.1.0"
+    }
+  }
