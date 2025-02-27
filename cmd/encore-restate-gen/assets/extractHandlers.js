@@ -1,35 +1,35 @@
 #!/usr/bin/env node
 "use strict";
 
-// Production-ready embedded Node.js script using ts-morph
-// This script extracts:
-//   1. The service name from an adjacent `encore.service.ts` file by looking for a default export
-//      that instantiates a Service (e.g. new Service("greeter")).
-//   2. All calls to Restate.addHandler in other .ts files in the directory, extracting the handler name
-//      and its function definition.
-// It then outputs a JSON manifest on stdout.
-
-const { Project, SyntaxKind } = require("ts-morph");
+const { Project, SyntaxKind, Node } = require("ts-morph");
 const fs = require("fs");
 const path = require("path");
 
 /**
  * Extracts handler definitions from a given TypeScript file.
- * Looks for call expressions of the form:
- *    Restate.addHandler('handlerName', async (ctx, ...) => { ... })
  *
- * @param {string} filePath - The full path to the .ts file.
- * @returns {Array<{name: string, body: string}>} Array of handler entries.
+ * It looks for exported functions or variables (whose initializer is an arrow function,
+ * function expression, or a call expression wrapping such a function) and then inspects
+ * the first parameter's type annotation (assumed to be the context).
+ *
+ * The handler type is determined as follows:
+ *   - If the type includes "WorkflowContext" or "WorkflowSharedContext": type is "workflow"
+ *   - If the type includes "ObjectContext" or "ObjectSharedContext": type is "virtualObject"
+ *   - Otherwise, if the type includes "Context": type is "service"
+ *
+ * The returned objects have:
+ *   - exportName: the variable or function name (e.g. "greetHandler")
+ *   - source: the relative path from the service directory to this file (as "./<basename>")
+ *   - type: one of "service", "workflow", or "virtualObject"
+ *
+ * @param {string} filePath - Full path to the .ts file.
+ * @param {string} targetDir - The service directory (where encore.service.ts resides).
+ * @returns {Array<{exportName: string, source: string, type: string}>}
  */
-function extractHandlersFromFile(filePath) {
+function extractHandlersFromFile(filePath, targetDir) {
   try {
-    // Create a new ts-morph Project instance.
     const project = new Project({
-      compilerOptions: {
-        allowJs: true,
-        target: 2, // ES6
-      },
-      // Optionally, you can specify tsconfig file path if available.
+      compilerOptions: { allowJs: true, target: 2 }
     });
     const sourceFile = project.addSourceFileAtPath(filePath);
     if (!sourceFile) {
@@ -37,35 +37,48 @@ function extractHandlersFromFile(filePath) {
       return [];
     }
     const results = [];
-    const callExpressions = sourceFile.getDescendantsOfKind(SyntaxKind.CallExpression);
-    for (const call of callExpressions) {
-      try {
-        // Identify calls to Restate.addHandler
-        if (call.getExpression().getText() === "Restate.addHandler") {
-          const args = call.getArguments();
-          if (args.length >= 2) {
-            // Extract the handler name and strip surrounding quotes.
-            let handlerName = args[0].getText().trim();
-            if (
-              handlerName.startsWith("'") ||
-              handlerName.startsWith("\"") ||
-              handlerName.startsWith("`")
-            ) {
-              handlerName = handlerName.slice(1, -1);
+    // Get all exported declarations
+    const exportedDeclarations = sourceFile.getExportedDeclarations();
+    exportedDeclarations.forEach((declarations, exportName) => {
+      for (const decl of declarations) {
+        let func;
+        if (Node.isFunctionDeclaration(decl)) {
+          func = decl;
+        } else if (Node.isVariableDeclaration(decl)) {
+          const initializer = decl.getInitializer();
+          if (initializer) {
+            if (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer)) {
+              func = initializer;
+            } else if (Node.isCallExpression(initializer)) {
+              // If the initializer is a call, check its first argument.
+              const args = initializer.getArguments();
+              if (args.length > 0 && (Node.isArrowFunction(args[0]) || Node.isFunctionExpression(args[0]))) {
+                func = args[0];
+              }
             }
-            // Get the full text of the handler function expression.
-            const handlerBody = args[1].getText();
-            results.push({ name: handlerName, body: handlerBody });
-          } else {
-            console.warn(
-              `Warning: Restate.addHandler call in ${filePath} does not have at least 2 arguments.`
-            );
           }
         }
-      } catch (innerErr) {
-        console.error(`Error processing a call in file ${filePath}: ${innerErr}`);
+        if (!func) continue;
+        const params = func.getParameters();
+        if (params.length === 0) continue;
+        const ctxParam = params[0];
+        const typeNode = ctxParam.getTypeNode();
+        if (!typeNode) continue;
+        const typeText = typeNode.getText();
+        let handlerType = null;
+        if (typeText.includes("WorkflowContext") || typeText.includes("WorkflowSharedContext")) {
+          handlerType = "workflow";
+        } else if (typeText.includes("ObjectContext") || typeText.includes("ObjectSharedContext")) {
+          handlerType = "virtualObject";
+        } else if (typeText.includes("Context")) {
+          handlerType = "service";
+        }
+        if (!handlerType) continue;
+        const baseName = path.basename(filePath, ".ts");
+        const relativeSource = "./" + baseName;
+        results.push({ exportName, source: relativeSource, type: handlerType });
       }
-    }
+    });
     return results;
   } catch (err) {
     console.error(`Error processing file ${filePath}: ${err}`);
@@ -75,10 +88,12 @@ function extractHandlersFromFile(filePath) {
 
 /**
  * Extracts the service name from the specified encore.service.ts file.
- * Searches for the default export that creates a new Service instance.
  *
- * @param {string} serviceFilePath - The full path to encore.service.ts.
- * @returns {string|null} The extracted service name, or null if not found.
+ * It looks for the default export and then searches for a new expression whose first argument
+ * is a string literal representing the service name.
+ *
+ * @param {string} serviceFilePath
+ * @returns {string|null}
  */
 function extractServiceName(serviceFilePath) {
   if (!fs.existsSync(serviceFilePath)) {
@@ -87,10 +102,7 @@ function extractServiceName(serviceFilePath) {
   }
   try {
     const project = new Project({
-      compilerOptions: {
-        allowJs: true,
-        target: 2,
-      },
+      compilerOptions: { allowJs: true, target: 2 }
     });
     const sourceFile = project.addSourceFileAtPath(serviceFilePath);
     if (!sourceFile) {
@@ -128,32 +140,24 @@ function extractServiceName(serviceFilePath) {
 
 /**
  * Main entry point.
- * Determines the target directory (from command line or cwd),
- * extracts the service name and handler definitions, and outputs a JSON manifest.
+ *
+ * Scans the target directory for .ts files (excluding encore.service.ts and generated files),
+ * extracts handlers from each file, and outputs a JSON manifest.
  */
 function main() {
   try {
-    // Determine the target directory from the command-line arguments or default to the current working directory.
     const targetDir = process.argv[2] || process.cwd();
     if (!fs.existsSync(targetDir) || !fs.statSync(targetDir).isDirectory()) {
       console.error(`Target directory does not exist or is not a directory: ${targetDir}`);
       process.exit(1);
     }
-
-    // Define the expected service file path.
     const serviceFilePath = path.join(targetDir, "encore.service.ts");
     const serviceName = extractServiceName(serviceFilePath);
     if (!serviceName) {
       console.error("Error: Service name extraction failed.");
       process.exit(1);
     }
-
-    const manifest = {
-      serviceName: serviceName,
-      handlers: []
-    };
-
-    // Read and process each .ts file (except for encore.service.ts and any generated files).
+    const manifest = { serviceName, handlers: [] };
     const files = fs.readdirSync(targetDir);
     for (const file of files) {
       if (
@@ -163,15 +167,12 @@ function main() {
       ) {
         const filePath = path.join(targetDir, file);
         if (fs.statSync(filePath).isFile()) {
-          const handlers = extractHandlersFromFile(filePath);
+          const handlers = extractHandlersFromFile(filePath, targetDir);
           manifest.handlers.push(...handlers);
         }
       }
     }
-
-    // Always output the manifest.
     process.stdout.write(JSON.stringify(manifest, null, 2));
-
   } catch (err) {
     console.error("Unexpected error occurred: " + err);
     process.exit(1);

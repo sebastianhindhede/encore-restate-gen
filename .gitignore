@@ -1,1 +1,5 @@
 node_modules
+*.restate.ts
+restate.gen
+encore.gen
+encore
